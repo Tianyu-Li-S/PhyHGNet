@@ -1,0 +1,66 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RT-DETR-l object detection model with P3-P5 outputs. For details see https://docs.ultralytics.com/models/rtdetr
+
+# Parameters
+nc: 80  # number of classes
+scales: # model compound scaling constants, i.e. 'model=yolov8n-cls.yaml' will call yolov8-cls.yaml with scale 'n'
+  # [depth, width, max_channels]
+  l: [1.00, 1.00, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, ConvNormLayer, [32, 3, 2, None, False, 'relu']] # 0-P1/2
+  - [-1, 1, ConvNormLayer, [32, 3, 1, None, False, 'relu']] # 1
+  - [-1, 1, ConvNormLayer, [64, 3, 1, None, False, 'relu']] # 2
+  - [-1, 1, nn.MaxPool2d, [3, 2, 1]] # 3-P2/4
+  
+  # Backbone Layers
+  - [-1, 1, Blocks, [64, BasicBlock_Faster_Block_CGLU, 2, 2, 'relu']] # 4 (P2) -> 物理增强的起点
+  - [-1, 1, Blocks, [128,BasicBlock_Faster_Block_CGLU, 2, 3, 'relu']] # 5 (P3)
+  - [-1, 1, Blocks, [256, BasicBlock_Faster_Block_CGLU, 2, 4, 'relu']] # 6 (P4)
+  - [-1, 1, Blocks, [512, BasicBlock_Faster_Block_CGLU, 2, 5, 'relu']] # 7 (P5)
+
+head:
+  # ================= Top-Down (自顶向下) =================
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 8 input_proj.2
+  - [-1, 1, TransformerEncoderLayer_MALA, [1024, 8]] # 9 [修改点] 这里实际上调用的是包含拉普拉斯锐化的类
+  - [-1, 1, Conv, [256, 1, 1]]  # 10 Y5
+
+  # 融合 P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 11
+  - [6, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 12
+  - [[-2, -1], 1, Concat, [1]] # 13
+  - [-1, 3, Converse2DC3, [256, 0.5]]  # 14
+  - [-1, 1, Conv, [256, 1, 1]]   # 15 Y4
+
+  # 融合 P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 16
+  - [5, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 17
+  - [[-2, -1], 1, Concat, [1]] # 18
+  - [-1, 3, Converse2DC3, [256, 0.5]]   # 19
+
+  # 融合 P2 (针对红外小目标的物理层)
+  - [-1, 1, Conv, [256, 1, 1]] # 20
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 21
+  - [4, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 22
+  - [[-2, -1], 1, Concat, [1]] # 23
+  
+
+  - [-1, 1, HyperComputeModule, [256, 0.5]] # 24 这里实际上调用的是 BoltzmannHyperGraph
+  - [-1, 3, Converse2DC3, [256, 0.5]] # 25 -> Output P2 (High Res)
+
+  # ================= Bottom-Up (自底向上) =================
+  
+  # P2 -> P3
+  - [-1, 1, Conv, [256, 3, 2]]    # 26
+  - [[-1, 19], 1, Concat, [1]]  # 27
+  - [-1, 3, Converse2DC3, [256, 0.5]]    # 28 -> Output P3
+
+  # P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]    # 29
+  - [[-1, 15], 1, Concat, [1]]  # 30
+  - [-1, 3, Converse2DC3, [256, 0.5]]    # 31 -> Output P4
+
+  # ================= Detect =================
+  # 使用 P2, P3, P4 进行检测
+  - [[25, 28, 31], 1, RTDETRDecoder, [nc, 256, 300, 4, 8, 3]]
