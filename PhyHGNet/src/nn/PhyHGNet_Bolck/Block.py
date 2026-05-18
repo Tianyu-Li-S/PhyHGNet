@@ -17,16 +17,6 @@ class BasicBlock_Faster_Block_CGLU(BasicBlock):
         
         self.branch2b = Faster_Block_CGLU(ch_out, ch_out)
 class Faster_Block_CGLU(nn.Module):
-    """
-    [轻量化重构版] Faster_Block_CGLU
-    适用场景: Backbone 主干网络
-    核心思想: 
-    1. 移除沉重的 Self-Attention 和 多分支卷积。
-    2. 引入 Physics-Informed (物理感知) 的特征提取：
-       - Laplacian Operator: 提取高频边缘 (Edge/Detail)
-       - Diffusion Filter: 提取低频背景 (Context/Background)
-    3. Math-Prior: 利用 GLU (Gated Linear Unit) 实现通道间的非线性选择。
-    """
     def __init__(self,
                  inc,
                  dim,
@@ -35,23 +25,19 @@ class Faster_Block_CGLU(nn.Module):
                  drop_path=0.0,
                  layer_scale_init_value=1e-6,
                  pconv_fw_type='split_cat', # 兼容参数
-                 # 遥感/物理参数
-                 use_spectral_attention=False, # 为了轻量化，建议在Backbone中设为False
+                 use_spectral_attention=False, 
                  spectral_bands=None,
                  **kwargs # 吸收多余参数
                  ):
         super().__init__()
         
-        # 1. 维度对齐 (Projection)
-        # 如果输入输出通道不一致，使用 1x1 卷积调整
+        # 1. 维度对齐
         self.proj = nn.Conv2d(inc, dim, 1, bias=False) if inc != dim else nn.Identity()
         
-        # 2. 物理先验空间混合器 (Physics-Informed Spatial Mixer)
-        # 替代了原有的 MultiScalePartialConv
+        # 2. 物理先验空间混合器 
         self.spatial_mixer = PhysicsSpatialMixer(dim)
 
-        # 3. 卷积门控单元 (CGLU) - 轻量化版
-        # 替代了原有的 MLP 和 ConvolutionalGLU
+        # 3. 卷积门控单元 (CGLU)
         self.cglu = LightweightCGLU(dim, expansion=mlp_ratio)
 
         # 4. DropPath 和 LayerScale (训练稳定性)
@@ -83,10 +69,7 @@ class Faster_Block_CGLU(nn.Module):
 
 
 class PhysicsSpatialMixer(nn.Module):
-    """
-    物理空间混合器
-    原理：信号处理中的 [高频提取] + [低频扩散]
-    """
+
     def __init__(self, dim):
         super().__init__()
         # A. 拉普拉斯锐化算子 (Laplacian Edge Detector)
@@ -110,7 +93,6 @@ class PhysicsSpatialMixer(nn.Module):
         
         # Path 1: 物理边缘提取 (High Frequency)
         # 使用 F.conv2d 直接计算，groups=C 对每个通道独立计算
-        # 注意：这里为了速度，我们复用输入x的通道作为groups
         b, c, h, w = x.shape
         laplacian_feat = F.conv2d(x, self.fixed_laplacian.repeat(c, 1, 1, 1), padding=1, groups=c)
         
@@ -123,15 +105,11 @@ class PhysicsSpatialMixer(nn.Module):
 
 
 class LightweightCGLU(nn.Module):
-    """
-    轻量级卷积门控单元 (CGLU)
-    数学原理: y = (x * W1) * sigmoid(x * W2)
-    """
+
     def __init__(self, dim, expansion=2):
         super().__init__()
         hidden_dim = int(dim * expansion)
         
-        # 为了极致轻量，我们在 CGLU 内部不使用大卷积，只使用 1x1
         # 上下文已经在 PhysicsSpatialMixer 中获取了
         self.fc1 = nn.Conv2d(dim, hidden_dim * 2, 1) # 升维
         self.dwc = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, 3, padding=1, groups=hidden_dim * 2, bias=False) # 极轻量的深度卷积
@@ -228,11 +206,7 @@ class RoPE(nn.Module):
         
         
 class LaplacianThermalSharpening(nn.Module):
-    """
-    物理模块：基于拉普拉斯算子的热斑增强
-    数学公式：Out = In - \lambda * \nabla^2(In)
-    物理含义：逆向热扩散，还原模糊前的热源形态
-    """
+
     def __init__(self, channels):
         super().__init__()
         # 定义拉普拉斯卷积核 (边缘/斑点检测算子)
@@ -252,11 +226,7 @@ class LaplacianThermalSharpening(nn.Module):
         return x + self.diff_coeff * laplacian
 
 class LiteFFN(nn.Module):
-    """
-    [轻量化] 替代笨重的标准 FFN
-    使用 Depthwise Separable Conv 结构，大幅减少参数量
-    结构: 1x1 Conv (升维) -> 3x3 DW-Conv (局部提取) -> 1x1 Conv (降维)
-    """
+
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
         super().__init__()
         out_features = out_features or in_features
@@ -283,13 +253,7 @@ class LiteFFN(nn.Module):
         return x
 
 class TransformerEncoderLayer_MALA(nn.Module):
-    """
-    [轻量化 + 物理增强] Lite-Thermo-MALA Layer
-    特点：
-    1. 保留 Laplacian 物理锐化 (针对红外)
-    2. 使用 LiteFFN 替代标准 FFN (减少70%参数)
-    3. 使用 BatchNorm 替代 LayerNorm (推理加速)
-    """
+
     def __init__(self, c1, cm=2048, num_heads=8, dropout=0.0, act=nn.GELU(), normalize_before=False):
         super().__init__()
         # 1. 核心注意力 (MALA)
@@ -315,9 +279,7 @@ class TransformerEncoderLayer_MALA(nn.Module):
         self.phys_alpha = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
-        """
-        结构优化：Post-Norm 结构，且移除繁琐的 permute
-        """
+
         # --- Block 1: Attention ---
         residual = src
         # MALA 期望输入 (B, C, H, W)
@@ -349,11 +311,7 @@ class Converse2DC3(RepC3):
         self.m = nn.Sequential(*[Converse2D(c_, c_, 3) for _ in range(n)])
 
 class Converse2D(nn.Module):
-    """
-    [物理重构版] Converse2D -> PhysicsConverse2D
-    功能：利用热扩散的逆过程（Inverse Diffusion）增强红外小目标。
-    兼容性：输入输出接口与标准 Conv 模块一致，支持 c1 != c2。
-    """
+
     def __init__(self, c1, c2, k=5, e=0.5):
         """
         参数:
